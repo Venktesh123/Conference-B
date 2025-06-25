@@ -18,7 +18,9 @@ const io = new Server(server, {
 
 // Store active rooms and participants
 const rooms = {};
-
+app.get("/", (req, res) => {
+  res.send("<h1>Hello</h1>");
+});
 // API endpoint to create a new room
 app.post("/api/room", (req, res) => {
   const roomId = uuidv4();
