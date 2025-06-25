@@ -1,37 +1,23 @@
 {
-  "name": "video-conference-backend",
+  "name": "server",
   "version": "1.0.0",
-  "description": "Video conferencing application backend with WebRTC and Socket.IO",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon server.js",
+    "start": "node server.js"
   },
-  "keywords": [
-    "video-conference",
-    "webrtc",
-    "socket.io",
-    "express",
-    "real-time"
-  ],
-  "author": "Your Name",
-  "license": "MIT",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
   "dependencies": {
-    "express": "^4.18.2",
-    "socket.io": "^4.7.2",
     "cors": "^2.8.5",
-    "uuid": "^9.0.1"
+    "express": "^5.1.0",
+    "socket.io": "^4.8.1",
+    "uuid": "^11.1.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
-  },
-  "engines": {
-    "node": ">=16.0.0",
-    "npm": ">=8.0.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/Venktesh123/Conference-B.git"
+    "nodemon": "^3.1.10"
   }
 }
