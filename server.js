@@ -108,6 +108,7 @@ io.on("connection", (socket) => {
         status: "approved",
         isHost: true,
         chatMessages: room.chatMessages,
+        participants: room.participants,
       });
 
       // Send current participants (empty for new room)
@@ -135,6 +136,7 @@ io.on("connection", (socket) => {
           participantId,
           username,
           peerId,
+          requestedAt: new Date(),
         });
       }
 
@@ -148,7 +150,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Handle host approving/denying participants
+  // Handle host approving participants
   socket.on("approve-participant", ({ roomId, participantId }) => {
     const room = rooms[roomId];
     if (!room || room.hostId !== socket.id) {
@@ -205,6 +207,12 @@ io.on("connection", (socket) => {
         peerId: waitingParticipant.peerId,
       });
 
+      // Send notification to host and other participants
+      io.to(roomId).emit("participant-approved", {
+        username: waitingParticipant.username,
+        message: `${waitingParticipant.username} has joined the meeting`,
+      });
+
       console.log(
         `Host approved ${waitingParticipant.username} to join room ${roomId}`
       );
@@ -257,12 +265,17 @@ io.on("connection", (socket) => {
       return;
     }
 
+    if (!message || message.trim().length === 0) {
+      return;
+    }
+
     const chatMessage = {
       id: uuidv4(),
       username,
       message: message.trim(),
       timestamp: new Date(),
       senderId: socket.id,
+      isHost: room.hostId === socket.id,
     };
 
     // Store message in room
@@ -324,13 +337,18 @@ io.on("connection", (socket) => {
     console.log(`Host removing participant: ${participantId}`);
 
     if (room.participants[participantId]) {
+      const removedParticipant = room.participants[participantId];
+
       // Notify the participant they're being removed
-      io.to(participantId).emit("you-were-removed");
+      io.to(participantId).emit("you-were-removed", {
+        message: "You have been removed from the meeting by the host",
+      });
 
       // Notify other participants
       socket.to(roomId).emit("user-removed", {
         participantId,
         peerId,
+        username: removedParticipant.username,
       });
 
       // Remove from room data
@@ -338,6 +356,12 @@ io.on("connection", (socket) => {
 
       // Force disconnect the removed user
       io.sockets.sockets.get(participantId)?.disconnect(true);
+
+      // Send notification to remaining participants
+      io.to(roomId).emit("participant-removed", {
+        username: removedParticipant.username,
+        message: `${removedParticipant.username} was removed from the meeting`,
+      });
     }
   });
 
@@ -353,6 +377,21 @@ io.on("connection", (socket) => {
 
     const waitingList = Object.values(room.waitingRoom);
     socket.emit("waiting-room-update", { waitingParticipants: waitingList });
+  });
+
+  // Handle typing indicators for chat
+  socket.on("typing-start", ({ roomId, username }) => {
+    const room = rooms[roomId];
+    if (room && room.participants[socket.id]) {
+      socket.to(roomId).emit("user-typing", { username });
+    }
+  });
+
+  socket.on("typing-stop", ({ roomId }) => {
+    const room = rooms[roomId];
+    if (room && room.participants[socket.id]) {
+      socket.to(roomId).emit("user-stopped-typing");
+    }
   });
 
   // Handle disconnection
@@ -380,10 +419,15 @@ io.on("connection", (socket) => {
             room.hostId = newHostId;
             room.participants[newHostId].isHost = true;
 
-            io.to(newHostId).emit("host-transferred", { isHost: true });
+            io.to(newHostId).emit("host-transferred", {
+              isHost: true,
+              message: "You are now the host of this meeting",
+            });
+
             io.to(roomId).emit("host-changed", {
               newHostId,
               newHostUsername: room.participants[newHostId].username,
+              message: `${room.participants[newHostId].username} is now the host`,
             });
 
             console.log(
@@ -399,6 +443,13 @@ io.on("connection", (socket) => {
         socket.to(roomId).emit("user-left", {
           participantId: socket.id,
           peerId: participant.peerId,
+          username: participant.username,
+        });
+
+        // Send notification
+        io.to(roomId).emit("participant-left", {
+          username: participant.username,
+          message: `${participant.username} left the meeting`,
         });
 
         // Remove from room data
@@ -413,6 +464,7 @@ io.on("connection", (socket) => {
 
       // Check if user was in waiting room
       if (room.waitingRoom[socket.id]) {
+        const waitingParticipant = room.waitingRoom[socket.id];
         delete room.waitingRoom[socket.id];
 
         // Update waiting room for host
@@ -422,6 +474,10 @@ io.on("connection", (socket) => {
             waitingParticipants: waitingList,
           });
         }
+
+        console.log(
+          `${waitingParticipant.username} left waiting room for ${roomId}`
+        );
       }
 
       // If room is empty, remove it after a delay
