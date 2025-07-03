@@ -16,18 +16,27 @@ const io = new Server(server, {
   },
 });
 
-// Store active rooms and participants
+// Store active rooms, participants, and chat messages
 const rooms = {};
+
 app.get("/", (req, res) => {
-  res.send("<h1>Hello</h1>");
+  res.send("<h1>Video Conference Server</h1>");
 });
+
 // API endpoint to create a new room
 app.post("/api/room", (req, res) => {
   const roomId = uuidv4();
   rooms[roomId] = {
     id: roomId,
     participants: {},
+    waitingRoom: {}, // Participants waiting for approval
+    chatMessages: [], // Store chat messages
+    hostId: null, // Will be set when first person joins
     createdAt: new Date(),
+    settings: {
+      requireApproval: true, // Host must approve participants
+      allowChat: true,
+    },
   };
   console.log(`Created room: ${roomId}`);
   res.json({ roomId });
@@ -45,9 +54,13 @@ app.get("/api/room/:roomId", (req, res) => {
   res.json({
     roomId: room.id,
     participantCount: Object.keys(room.participants).length,
+    waitingCount: Object.keys(room.waitingRoom).length,
+    hasHost: !!room.hostId,
+    settings: room.settings,
     participants: Object.values(room.participants).map((p) => ({
       username: p.username,
       joinedAt: p.joinedAt,
+      isHost: p.id === room.hostId,
     })),
   });
 });
@@ -69,51 +82,201 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Add user to socket room
-    socket.join(roomId);
-
-    // Store participant info
+    const room = rooms[roomId];
     const participantId = socket.id;
-    rooms[roomId].participants[participantId] = {
-      id: participantId,
-      username,
-      peerId,
-      socketId: socket.id,
+
+    // If no host exists, make this person the host
+    if (!room.hostId) {
+      room.hostId = participantId;
+
+      // Add host directly to the room
+      socket.join(roomId);
+      room.participants[participantId] = {
+        id: participantId,
+        username,
+        peerId,
+        socketId: socket.id,
+        joinedAt: new Date(),
+        audioEnabled: true,
+        videoEnabled: true,
+        isHost: true,
+      };
+
+      console.log(`${username} joined as HOST of room ${roomId}`);
+
+      socket.emit("admission-status", {
+        status: "approved",
+        isHost: true,
+        chatMessages: room.chatMessages,
+      });
+
+      // Send current participants (empty for new room)
+      socket.emit("room-participants", { participants: {} });
+    } else {
+      // Add to waiting room for approval
+      room.waitingRoom[participantId] = {
+        id: participantId,
+        username,
+        peerId,
+        socketId: socket.id,
+        requestedAt: new Date(),
+      };
+
+      console.log(`${username} added to waiting room for room ${roomId}`);
+
+      socket.emit("admission-status", {
+        status: "waiting",
+        message: "Waiting for host approval...",
+      });
+
+      // Notify host about new participant waiting
+      if (room.hostId) {
+        io.to(room.hostId).emit("participant-waiting", {
+          participantId,
+          username,
+          peerId,
+        });
+      }
+
+      // Send current waiting list to host
+      const waitingList = Object.values(room.waitingRoom);
+      if (room.hostId) {
+        io.to(room.hostId).emit("waiting-room-update", {
+          waitingParticipants: waitingList,
+        });
+      }
+    }
+  });
+
+  // Handle host approving/denying participants
+  socket.on("approve-participant", ({ roomId, participantId }) => {
+    const room = rooms[roomId];
+    if (!room || room.hostId !== socket.id) {
+      socket.emit("error", {
+        message: "Unauthorized: Only host can approve participants",
+      });
+      return;
+    }
+
+    const waitingParticipant = room.waitingRoom[participantId];
+    if (!waitingParticipant) {
+      return;
+    }
+
+    // Move from waiting room to participants
+    room.participants[participantId] = {
+      ...waitingParticipant,
       joinedAt: new Date(),
       audioEnabled: true,
       videoEnabled: true,
+      isHost: false,
     };
 
+    delete room.waitingRoom[participantId];
+
+    // Join the socket to the room
+    const participantSocket = io.sockets.sockets.get(participantId);
+    if (participantSocket) {
+      participantSocket.join(roomId);
+
+      // Notify approved participant
+      participantSocket.emit("admission-status", {
+        status: "approved",
+        isHost: false,
+        chatMessages: room.chatMessages,
+      });
+
+      // Send existing participants to newly approved user
+      const existingParticipants = {};
+      Object.entries(room.participants).forEach(([id, participant]) => {
+        if (id !== participantId) {
+          existingParticipants[id] = participant;
+        }
+      });
+
+      participantSocket.emit("room-participants", {
+        participants: existingParticipants,
+      });
+
+      // Notify existing participants about new user
+      socket.to(roomId).emit("user-joined", {
+        participantId,
+        username: waitingParticipant.username,
+        peerId: waitingParticipant.peerId,
+      });
+
+      console.log(
+        `Host approved ${waitingParticipant.username} to join room ${roomId}`
+      );
+    }
+
+    // Update waiting room for host
+    const waitingList = Object.values(room.waitingRoom);
+    socket.emit("waiting-room-update", { waitingParticipants: waitingList });
+  });
+
+  socket.on("deny-participant", ({ roomId, participantId }) => {
+    const room = rooms[roomId];
+    if (!room || room.hostId !== socket.id) {
+      socket.emit("error", {
+        message: "Unauthorized: Only host can deny participants",
+      });
+      return;
+    }
+
+    const waitingParticipant = room.waitingRoom[participantId];
+    if (!waitingParticipant) {
+      return;
+    }
+
+    // Notify denied participant
+    const participantSocket = io.sockets.sockets.get(participantId);
+    if (participantSocket) {
+      participantSocket.emit("admission-status", {
+        status: "denied",
+        message: "Access denied by host",
+      });
+      participantSocket.disconnect(true);
+    }
+
+    delete room.waitingRoom[participantId];
     console.log(
-      `${username} joined room ${roomId}. Total participants: ${
-        Object.keys(rooms[roomId].participants).length
-      }`
+      `Host denied ${waitingParticipant.username} access to room ${roomId}`
     );
 
-    // Notify existing participants about the new user
-    socket.to(roomId).emit("user-joined", {
-      participantId,
+    // Update waiting room for host
+    const waitingList = Object.values(room.waitingRoom);
+    socket.emit("waiting-room-update", { waitingParticipants: waitingList });
+  });
+
+  // Handle chat messages
+  socket.on("send-message", ({ roomId, message, username }) => {
+    const room = rooms[roomId];
+    if (!room || !room.participants[socket.id]) {
+      socket.emit("error", { message: "You are not in this room" });
+      return;
+    }
+
+    const chatMessage = {
+      id: uuidv4(),
       username,
-      peerId,
-    });
+      message: message.trim(),
+      timestamp: new Date(),
+      senderId: socket.id,
+    };
 
-    // Send current participants to the new user
-    const existingParticipants = {};
-    Object.entries(rooms[roomId].participants).forEach(([id, participant]) => {
-      if (id !== participantId) {
-        existingParticipants[id] = participant;
-      }
-    });
+    // Store message in room
+    room.chatMessages.push(chatMessage);
 
-    socket.emit("room-participants", {
-      participants: existingParticipants,
-    });
+    // Keep only last 100 messages
+    if (room.chatMessages.length > 100) {
+      room.chatMessages = room.chatMessages.slice(-100);
+    }
 
-    console.log(
-      `Sent ${
-        Object.keys(existingParticipants).length
-      } existing participants to ${username}`
-    );
+    // Broadcast message to all participants in the room
+    io.to(roomId).emit("new-message", chatMessage);
+
+    console.log(`${username} sent message in room ${roomId}: ${message}`);
   });
 
   // Handle user muting/unmuting audio
@@ -148,11 +311,19 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Handle removing a participant (by admin)
+  // Handle removing a participant (by host)
   socket.on("remove-participant", ({ roomId, participantId, peerId }) => {
-    console.log(`Removing participant: ${participantId}`);
+    const room = rooms[roomId];
+    if (!room || room.hostId !== socket.id) {
+      socket.emit("error", {
+        message: "Unauthorized: Only host can remove participants",
+      });
+      return;
+    }
 
-    if (rooms[roomId] && rooms[roomId].participants[participantId]) {
+    console.log(`Host removing participant: ${participantId}`);
+
+    if (room.participants[participantId]) {
       // Notify the participant they're being removed
       io.to(participantId).emit("you-were-removed");
 
@@ -163,11 +334,25 @@ io.on("connection", (socket) => {
       });
 
       // Remove from room data
-      delete rooms[roomId].participants[participantId];
+      delete room.participants[participantId];
 
       // Force disconnect the removed user
       io.sockets.sockets.get(participantId)?.disconnect(true);
     }
+  });
+
+  // Get waiting room participants (for host)
+  socket.on("get-waiting-room", ({ roomId }) => {
+    const room = rooms[roomId];
+    if (!room || room.hostId !== socket.id) {
+      socket.emit("error", {
+        message: "Unauthorized: Only host can view waiting room",
+      });
+      return;
+    }
+
+    const waitingList = Object.values(room.waitingRoom);
+    socket.emit("waiting-room-update", { waitingParticipants: waitingList });
   });
 
   // Handle disconnection
@@ -176,10 +361,39 @@ io.on("connection", (socket) => {
 
     // Find which room this user was in
     for (const roomId in rooms) {
-      if (rooms[roomId].participants[socket.id]) {
-        const participant = rooms[roomId].participants[socket.id];
+      const room = rooms[roomId];
 
+      // Check if user was in participants
+      if (room.participants[socket.id]) {
+        const participant = room.participants[socket.id];
         console.log(`${participant.username} left room ${roomId}`);
+
+        // If this was the host, transfer host to another participant or close room
+        if (room.hostId === socket.id) {
+          const remainingParticipants = Object.keys(room.participants).filter(
+            (id) => id !== socket.id
+          );
+
+          if (remainingParticipants.length > 0) {
+            // Transfer host to first remaining participant
+            const newHostId = remainingParticipants[0];
+            room.hostId = newHostId;
+            room.participants[newHostId].isHost = true;
+
+            io.to(newHostId).emit("host-transferred", { isHost: true });
+            io.to(roomId).emit("host-changed", {
+              newHostId,
+              newHostUsername: room.participants[newHostId].username,
+            });
+
+            console.log(
+              `Host transferred to ${room.participants[newHostId].username}`
+            );
+          } else {
+            // No participants left, room will be cleaned up
+            room.hostId = null;
+          }
+        }
 
         // Notify other participants
         socket.to(roomId).emit("user-left", {
@@ -188,28 +402,43 @@ io.on("connection", (socket) => {
         });
 
         // Remove from room data
-        delete rooms[roomId].participants[socket.id];
+        delete room.participants[socket.id];
 
         console.log(
           `Room ${roomId} now has ${
-            Object.keys(rooms[roomId].participants).length
+            Object.keys(room.participants).length
           } participants`
         );
+      }
 
-        // If room is empty, remove it after a delay
-        if (Object.keys(rooms[roomId].participants).length === 0) {
-          setTimeout(() => {
-            if (
-              rooms[roomId] &&
-              Object.keys(rooms[roomId].participants).length === 0
-            ) {
-              delete rooms[roomId];
-              console.log(`Room ${roomId} has been removed due to inactivity`);
-            }
-          }, 60000); // Remove after 1 minute of inactivity
+      // Check if user was in waiting room
+      if (room.waitingRoom[socket.id]) {
+        delete room.waitingRoom[socket.id];
+
+        // Update waiting room for host
+        if (room.hostId) {
+          const waitingList = Object.values(room.waitingRoom);
+          io.to(room.hostId).emit("waiting-room-update", {
+            waitingParticipants: waitingList,
+          });
         }
+      }
 
-        break;
+      // If room is empty, remove it after a delay
+      if (
+        Object.keys(room.participants).length === 0 &&
+        Object.keys(room.waitingRoom).length === 0
+      ) {
+        setTimeout(() => {
+          if (
+            rooms[roomId] &&
+            Object.keys(rooms[roomId].participants).length === 0 &&
+            Object.keys(rooms[roomId].waitingRoom).length === 0
+          ) {
+            delete rooms[roomId];
+            console.log(`Room ${roomId} has been removed due to inactivity`);
+          }
+        }, 60000); // Remove after 1 minute of inactivity
       }
     }
   });
@@ -224,12 +453,22 @@ io.on("connection", (socket) => {
 app.get("/api/debug/rooms", (req, res) => {
   const roomSummary = {};
   Object.keys(rooms).forEach((roomId) => {
+    const room = rooms[roomId];
     roomSummary[roomId] = {
-      participantCount: Object.keys(rooms[roomId].participants).length,
-      participants: Object.values(rooms[roomId].participants).map((p) => ({
+      participantCount: Object.keys(room.participants).length,
+      waitingCount: Object.keys(room.waitingRoom).length,
+      messageCount: room.chatMessages.length,
+      hostId: room.hostId,
+      participants: Object.values(room.participants).map((p) => ({
         username: p.username,
         peerId: p.peerId,
+        isHost: p.isHost,
         joinedAt: p.joinedAt,
+      })),
+      waiting: Object.values(room.waitingRoom).map((p) => ({
+        username: p.username,
+        peerId: p.peerId,
+        requestedAt: p.requestedAt,
       })),
     };
   });
