@@ -29,12 +29,12 @@ app.post("/api/room", (req, res) => {
   rooms[roomId] = {
     id: roomId,
     participants: {},
-    waitingRoom: {}, // Participants waiting for approval
-    chatMessages: [], // Store chat messages
-    hostId: null, // Will be set when first person joins
+    waitingRoom: {},
+    chatMessages: [],
+    hostId: null,
     createdAt: new Date(),
     settings: {
-      requireApproval: true, // Host must approve participants
+      requireApproval: true,
       allowChat: true,
     },
   };
@@ -85,6 +85,14 @@ io.on("connection", (socket) => {
     const room = rooms[roomId];
     const participantId = socket.id;
 
+    // Validate inputs
+    if (!username || !peerId) {
+      socket.emit("room-error", {
+        message: "Username and peer ID are required",
+      });
+      return;
+    }
+
     // If no host exists, make this person the host
     if (!room.hostId) {
       room.hostId = participantId;
@@ -104,6 +112,7 @@ io.on("connection", (socket) => {
 
       console.log(`${username} joined as HOST of room ${roomId}`);
 
+      // Emit admission status to the host
       socket.emit("admission-status", {
         status: "approved",
         isHost: true,
@@ -114,6 +123,21 @@ io.on("connection", (socket) => {
       // Send current participants (empty for new room)
       socket.emit("room-participants", { participants: {} });
     } else {
+      // Check if user is already in waiting room or participants
+      const existingInWaiting = Object.values(room.waitingRoom).find(
+        (p) => p.username === username
+      );
+      const existingInRoom = Object.values(room.participants).find(
+        (p) => p.username === username
+      );
+
+      if (existingInWaiting || existingInRoom) {
+        socket.emit("room-error", {
+          message: "A user with this name is already in the meeting",
+        });
+        return;
+      }
+
       // Add to waiting room for approval
       room.waitingRoom[participantId] = {
         id: participantId,
@@ -125,6 +149,7 @@ io.on("connection", (socket) => {
 
       console.log(`${username} added to waiting room for room ${roomId}`);
 
+      // Emit waiting status
       socket.emit("admission-status", {
         status: "waiting",
         message: "Waiting for host approval...",
@@ -138,11 +163,9 @@ io.on("connection", (socket) => {
           peerId,
           requestedAt: new Date(),
         });
-      }
 
-      // Send current waiting list to host
-      const waitingList = Object.values(room.waitingRoom);
-      if (room.hostId) {
+        // Send updated waiting list to host
+        const waitingList = Object.values(room.waitingRoom);
         io.to(room.hostId).emit("waiting-room-update", {
           waitingParticipants: waitingList,
         });
@@ -153,7 +176,12 @@ io.on("connection", (socket) => {
   // Handle host approving participants
   socket.on("approve-participant", ({ roomId, participantId }) => {
     const room = rooms[roomId];
-    if (!room || room.hostId !== socket.id) {
+    if (!room) {
+      socket.emit("error", { message: "Room not found" });
+      return;
+    }
+
+    if (room.hostId !== socket.id) {
       socket.emit("error", {
         message: "Unauthorized: Only host can approve participants",
       });
@@ -162,6 +190,9 @@ io.on("connection", (socket) => {
 
     const waitingParticipant = room.waitingRoom[participantId];
     if (!waitingParticipant) {
+      socket.emit("error", {
+        message: "Participant not found in waiting room",
+      });
       return;
     }
 
@@ -223,9 +254,15 @@ io.on("connection", (socket) => {
     socket.emit("waiting-room-update", { waitingParticipants: waitingList });
   });
 
+  // Handle host denying participants
   socket.on("deny-participant", ({ roomId, participantId }) => {
     const room = rooms[roomId];
-    if (!room || room.hostId !== socket.id) {
+    if (!room) {
+      socket.emit("error", { message: "Room not found" });
+      return;
+    }
+
+    if (room.hostId !== socket.id) {
       socket.emit("error", {
         message: "Unauthorized: Only host can deny participants",
       });
@@ -234,6 +271,9 @@ io.on("connection", (socket) => {
 
     const waitingParticipant = room.waitingRoom[participantId];
     if (!waitingParticipant) {
+      socket.emit("error", {
+        message: "Participant not found in waiting room",
+      });
       return;
     }
 
@@ -244,7 +284,11 @@ io.on("connection", (socket) => {
         status: "denied",
         message: "Access denied by host",
       });
-      participantSocket.disconnect(true);
+
+      // Disconnect the denied participant after a delay
+      setTimeout(() => {
+        participantSocket.disconnect(true);
+      }, 1000);
     }
 
     delete room.waitingRoom[participantId];
@@ -260,12 +304,24 @@ io.on("connection", (socket) => {
   // Handle chat messages
   socket.on("send-message", ({ roomId, message, username }) => {
     const room = rooms[roomId];
-    if (!room || !room.participants[socket.id]) {
+    if (!room) {
+      socket.emit("error", { message: "Room not found" });
+      return;
+    }
+
+    if (!room.participants[socket.id]) {
       socket.emit("error", { message: "You are not in this room" });
       return;
     }
 
     if (!message || message.trim().length === 0) {
+      socket.emit("error", { message: "Message cannot be empty" });
+      return;
+    }
+
+    // Validate message length
+    if (message.trim().length > 500) {
+      socket.emit("error", { message: "Message too long" });
       return;
     }
 
@@ -289,15 +345,21 @@ io.on("connection", (socket) => {
     // Broadcast message to all participants in the room
     io.to(roomId).emit("new-message", chatMessage);
 
-    console.log(`${username} sent message in room ${roomId}: ${message}`);
+    console.log(
+      `${username} sent message in room ${roomId}: ${message.substring(
+        0,
+        50
+      )}...`
+    );
   });
 
   // Handle user muting/unmuting audio
   socket.on("toggle-audio", ({ roomId, peerId, enabled }) => {
     console.log(`Audio toggle: ${socket.id} - ${enabled}`);
 
-    if (rooms[roomId] && rooms[roomId].participants[socket.id]) {
-      rooms[roomId].participants[socket.id].audioEnabled = enabled;
+    const room = rooms[roomId];
+    if (room && room.participants[socket.id]) {
+      room.participants[socket.id].audioEnabled = enabled;
 
       // Notify other participants
       socket.to(roomId).emit("user-toggle-audio", {
@@ -312,8 +374,9 @@ io.on("connection", (socket) => {
   socket.on("toggle-video", ({ roomId, peerId, enabled }) => {
     console.log(`Video toggle: ${socket.id} - ${enabled}`);
 
-    if (rooms[roomId] && rooms[roomId].participants[socket.id]) {
-      rooms[roomId].participants[socket.id].videoEnabled = enabled;
+    const room = rooms[roomId];
+    if (room && room.participants[socket.id]) {
+      room.participants[socket.id].videoEnabled = enabled;
 
       // Notify other participants
       socket.to(roomId).emit("user-toggle-video", {
@@ -327,7 +390,12 @@ io.on("connection", (socket) => {
   // Handle removing a participant (by host)
   socket.on("remove-participant", ({ roomId, participantId, peerId }) => {
     const room = rooms[roomId];
-    if (!room || room.hostId !== socket.id) {
+    if (!room) {
+      socket.emit("error", { message: "Room not found" });
+      return;
+    }
+
+    if (room.hostId !== socket.id) {
       socket.emit("error", {
         message: "Unauthorized: Only host can remove participants",
       });
@@ -355,7 +423,12 @@ io.on("connection", (socket) => {
       delete room.participants[participantId];
 
       // Force disconnect the removed user
-      io.sockets.sockets.get(participantId)?.disconnect(true);
+      const removedSocket = io.sockets.sockets.get(participantId);
+      if (removedSocket) {
+        setTimeout(() => {
+          removedSocket.disconnect(true);
+        }, 1000);
+      }
 
       // Send notification to remaining participants
       io.to(roomId).emit("participant-removed", {
@@ -368,7 +441,12 @@ io.on("connection", (socket) => {
   // Get waiting room participants (for host)
   socket.on("get-waiting-room", ({ roomId }) => {
     const room = rooms[roomId];
-    if (!room || room.hostId !== socket.id) {
+    if (!room) {
+      socket.emit("error", { message: "Room not found" });
+      return;
+    }
+
+    if (room.hostId !== socket.id) {
       socket.emit("error", {
         message: "Unauthorized: Only host can view waiting room",
       });
@@ -480,7 +558,7 @@ io.on("connection", (socket) => {
         );
       }
 
-      // If room is empty, remove it after a delay
+      // If room is empty, schedule it for cleanup
       if (
         Object.keys(room.participants).length === 0 &&
         Object.keys(room.waitingRoom).length === 0
@@ -501,7 +579,14 @@ io.on("connection", (socket) => {
 
   // Handle ping for connection testing
   socket.on("ping", (callback) => {
-    callback("pong");
+    if (typeof callback === "function") {
+      callback("pong");
+    }
+  });
+
+  // Error handling for socket
+  socket.on("error", (error) => {
+    console.error(`Socket error for ${socket.id}:`, error);
   });
 });
 
@@ -515,11 +600,14 @@ app.get("/api/debug/rooms", (req, res) => {
       waitingCount: Object.keys(room.waitingRoom).length,
       messageCount: room.chatMessages.length,
       hostId: room.hostId,
+      createdAt: room.createdAt,
       participants: Object.values(room.participants).map((p) => ({
         username: p.username,
         peerId: p.peerId,
         isHost: p.isHost,
         joinedAt: p.joinedAt,
+        audioEnabled: p.audioEnabled,
+        videoEnabled: p.videoEnabled,
       })),
       waiting: Object.values(room.waitingRoom).map((p) => ({
         username: p.username,
@@ -531,8 +619,50 @@ app.get("/api/debug/rooms", (req, res) => {
   res.json(roomSummary);
 });
 
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    rooms: Object.keys(rooms).length,
+    totalParticipants: Object.values(rooms).reduce(
+      (sum, room) => sum + Object.keys(room.participants).length,
+      0
+    ),
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: "Something went wrong!" });
+});
+
+// Handle 404
+app.use((req, res) => {
+  res.status(404).json({ error: "Endpoint not found" });
+});
+
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Debug endpoint: http://localhost:${PORT}/api/debug/rooms`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
+});
+
+// Graceful shutdown
+process.on("SIGINT", () => {
+  console.log("Shutting down gracefully...");
+  server.close(() => {
+    console.log("Server closed");
+    process.exit(0);
+  });
+});
+
+process.on("SIGTERM", () => {
+  console.log("Shutting down gracefully...");
+  server.close(() => {
+    console.log("Server closed");
+    process.exit(0);
+  });
 });
