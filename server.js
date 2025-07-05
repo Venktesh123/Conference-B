@@ -5,19 +5,41 @@ const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
-app.use(cors());
+
+// Enhanced CORS configuration - Allow everything
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["*"],
+    credentials: true,
+  })
+);
+
 app.use(express.json());
 
 const server = http.createServer(app);
+
+// Enhanced Socket.IO CORS configuration
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
+    allowedHeaders: ["*"],
+    credentials: true,
   },
+  transports: ["websocket", "polling"],
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  upgradeTimeout: 30000,
+  allowEIO3: true,
 });
 
 // Store active rooms, participants, and chat messages
 const rooms = {};
+
+// Add preflight handler for all routes
+app.options("*", cors());
 
 app.get("/", (req, res) => {
   res.send("<h1>Video Conference Server is Running</h1>");
@@ -25,7 +47,7 @@ app.get("/", (req, res) => {
 
 // API endpoint to create a new room
 app.post("/api/room", (req, res) => {
-  const roomId = generateRoomId(); // Use a shorter, more user-friendly ID
+  const roomId = generateRoomId();
   rooms[roomId] = {
     id: roomId,
     participants: {},
@@ -71,9 +93,22 @@ app.get("/api/room/:roomId", (req, res) => {
   });
 });
 
-// Socket.io connection handling
+// Enhanced Socket.IO connection handling
 io.on("connection", (socket) => {
   console.log(`🔌 User connected: ${socket.id}`);
+
+  // Send heartbeat
+  const heartbeat = setInterval(() => {
+    if (socket.connected) {
+      socket.emit("heartbeat");
+    } else {
+      clearInterval(heartbeat);
+    }
+  }, 30000);
+
+  socket.on("heartbeat-response", () => {
+    console.log(`💓 Heartbeat from ${socket.id}`);
+  });
 
   // Handle joining a room
   socket.on("join-room", ({ roomId, username, peerId }) => {
@@ -442,9 +477,20 @@ io.on("connection", (socket) => {
     socket.emit("waiting-room-update", { waitingParticipants: waitingList });
   });
 
+  // Handle peer connection signals
+  socket.on("peer-signal", ({ signal, peerId, targetPeerId }) => {
+    console.log(`📡 Relaying signal from ${peerId} to ${targetPeerId}`);
+    socket.to(targetPeerId).emit("peer-signal", {
+      signal,
+      peerId,
+      targetPeerId: peerId,
+    });
+  });
+
   // Handle disconnection
-  socket.on("disconnect", () => {
-    console.log(`🔌 User disconnected: ${socket.id}`);
+  socket.on("disconnect", (reason) => {
+    console.log(`🔌 User disconnected: ${socket.id}, reason: ${reason}`);
+    clearInterval(heartbeat);
 
     // Find which room this user was in
     for (const roomId in rooms) {
@@ -540,6 +586,11 @@ io.on("connection", (socket) => {
       callback("pong");
     }
   });
+
+  // Error handling
+  socket.on("error", (error) => {
+    console.error(`❌ Socket error for ${socket.id}:`, error);
+  });
 });
 
 // Debug endpoint to see all rooms
@@ -617,4 +668,13 @@ process.on("SIGTERM", () => {
     console.log("Server closed");
     process.exit(0);
   });
+});
+
+// Handle uncaught exceptions
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
