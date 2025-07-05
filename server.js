@@ -16,7 +16,9 @@ app.use(
   })
 );
 
-app.use(express.json());
+// Body parser middleware (built into Express 4.16+)
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 const server = http.createServer(app);
 
@@ -47,21 +49,26 @@ app.get("/", (req, res) => {
 
 // API endpoint to create a new room
 app.post("/api/room", (req, res) => {
-  const roomId = generateRoomId();
-  rooms[roomId] = {
-    id: roomId,
-    participants: {},
-    waitingRoom: {},
-    chatMessages: [],
-    hostId: null,
-    createdAt: new Date(),
-    settings: {
-      requireApproval: true,
-      allowChat: true,
-    },
-  };
-  console.log(`✅ Created room: ${roomId}`);
-  res.json({ roomId });
+  try {
+    const roomId = generateRoomId();
+    rooms[roomId] = {
+      id: roomId,
+      participants: {},
+      waitingRoom: {},
+      chatMessages: [],
+      hostId: null,
+      createdAt: new Date(),
+      settings: {
+        requireApproval: true,
+        allowChat: true,
+      },
+    };
+    console.log(`✅ Created room: ${roomId}`);
+    res.json({ roomId });
+  } catch (error) {
+    console.error("Error creating room:", error);
+    res.status(500).json({ error: "Failed to create room" });
+  }
 });
 
 // Generate a shorter, more user-friendly room ID
@@ -76,21 +83,26 @@ function generateRoomId() {
 
 // Get room info
 app.get("/api/room/:roomId", (req, res) => {
-  const { roomId } = req.params;
-  const room = rooms[roomId];
+  try {
+    const { roomId } = req.params;
+    const room = rooms[roomId];
 
-  if (!room) {
-    return res.status(404).json({ error: "Room not found" });
+    if (!room) {
+      return res.status(404).json({ error: "Room not found" });
+    }
+
+    res.json({
+      roomId: room.id,
+      participantCount: Object.keys(room.participants).length,
+      waitingCount: Object.keys(room.waitingRoom).length,
+      hasHost: !!room.hostId,
+      settings: room.settings,
+      createdAt: room.createdAt,
+    });
+  } catch (error) {
+    console.error("Error getting room info:", error);
+    res.status(500).json({ error: "Failed to get room info" });
   }
-
-  res.json({
-    roomId: room.id,
-    participantCount: Object.keys(room.participants).length,
-    waitingCount: Object.keys(room.waitingRoom).length,
-    hasHost: !!room.hostId,
-    settings: room.settings,
-    createdAt: room.createdAt,
-  });
 });
 
 // Enhanced Socket.IO connection handling
@@ -595,49 +607,59 @@ io.on("connection", (socket) => {
 
 // Debug endpoint to see all rooms
 app.get("/api/debug/rooms", (req, res) => {
-  const roomSummary = {};
-  Object.keys(rooms).forEach((roomId) => {
-    const room = rooms[roomId];
-    roomSummary[roomId] = {
-      participantCount: Object.keys(room.participants).length,
-      waitingCount: Object.keys(room.waitingRoom).length,
-      messageCount: room.chatMessages.length,
-      hostId: room.hostId,
-      createdAt: room.createdAt,
-      participants: Object.values(room.participants).map((p) => ({
-        username: p.username,
-        isHost: p.isHost,
-        joinedAt: p.joinedAt,
-      })),
-      waiting: Object.values(room.waitingRoom).map((p) => ({
-        username: p.username,
-        requestedAt: p.requestedAt,
-      })),
-    };
-  });
-  res.json(roomSummary);
+  try {
+    const roomSummary = {};
+    Object.keys(rooms).forEach((roomId) => {
+      const room = rooms[roomId];
+      roomSummary[roomId] = {
+        participantCount: Object.keys(room.participants).length,
+        waitingCount: Object.keys(room.waitingRoom).length,
+        messageCount: room.chatMessages.length,
+        hostId: room.hostId,
+        createdAt: room.createdAt,
+        participants: Object.values(room.participants).map((p) => ({
+          username: p.username,
+          isHost: p.isHost,
+          joinedAt: p.joinedAt,
+        })),
+        waiting: Object.values(room.waitingRoom).map((p) => ({
+          username: p.username,
+          requestedAt: p.requestedAt,
+        })),
+      };
+    });
+    res.json(roomSummary);
+  } catch (error) {
+    console.error("Error in debug endpoint:", error);
+    res.status(500).json({ error: "Failed to get room debug info" });
+  }
 });
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.json({
-    status: "healthy",
-    timestamp: new Date().toISOString(),
-    rooms: Object.keys(rooms).length,
-    totalParticipants: Object.values(rooms).reduce(
-      (sum, room) => sum + Object.keys(room.participants).length,
-      0
-    ),
-    totalWaiting: Object.values(rooms).reduce(
-      (sum, room) => sum + Object.keys(room.waitingRoom).length,
-      0
-    ),
-  });
+  try {
+    res.json({
+      status: "healthy",
+      timestamp: new Date().toISOString(),
+      rooms: Object.keys(rooms).length,
+      totalParticipants: Object.values(rooms).reduce(
+        (sum, room) => sum + Object.keys(room.participants).length,
+        0
+      ),
+      totalWaiting: Object.values(rooms).reduce(
+        (sum, room) => sum + Object.keys(room.waitingRoom).length,
+        0
+      ),
+    });
+  } catch (error) {
+    console.error("Error in health check:", error);
+    res.status(500).json({ error: "Health check failed" });
+  }
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error(err.stack);
+  console.error("Express error:", err.stack);
   res.status(500).json({ error: "Something went wrong!" });
 });
 
@@ -647,7 +669,11 @@ app.use((req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
+server.listen(PORT, (err) => {
+  if (err) {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+  }
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔧 Debug endpoint: http://localhost:${PORT}/api/debug/rooms`);
   console.log(`❤️ Health check: http://localhost:${PORT}/health`);
@@ -673,8 +699,10 @@ process.on("SIGTERM", () => {
 // Handle uncaught exceptions
 process.on("uncaughtException", (error) => {
   console.error("Uncaught Exception:", error);
+  process.exit(1);
 });
 
 process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection at:", promise, "reason:", reason);
+  process.exit(1);
 });
